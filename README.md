@@ -36,25 +36,25 @@ On first run the script opens a headed browser window for you to log in to Music
 
 ```bash
 # Fetch discography + check MB, then submit all missing releases
-python3 mb_batch_submit.py https://www.deezer.com/artist/123
+python3 deezer2mb.py https://www.deezer.com/artist/123
 
 # Inspect only — fetch and check MB but do not submit
-python3 mb_batch_submit.py https://www.deezer.com/artist/123 --setup-only
+python3 deezer2mb.py https://www.deezer.com/artist/123 --setup-only
 
 # Resume from a saved JSON (skips the Deezer/MB setup phase)
-python3 mb_batch_submit.py /tmp/artist_discography.json
+python3 deezer2mb.py /tmp/artist_discography.json
 
 # Resume from a specific index
-python3 mb_batch_submit.py /tmp/artist_discography.json --start 10
+python3 deezer2mb.py /tmp/artist_discography.json --start 10
 
 # Submit at most N releases
-python3 mb_batch_submit.py /tmp/artist_discography.json --limit 5
+python3 deezer2mb.py /tmp/artist_discography.json --limit 5
 
 # Re-verify UNCERTAIN/FAILED entries against MB API before submitting
-python3 mb_batch_submit.py /tmp/artist_discography.json --recheck
+python3 deezer2mb.py /tmp/artist_discography.json --recheck
 
 # Pre-seed the MBID cache for ambiguous artist names
-python3 mb_batch_submit.py https://www.deezer.com/artist/123 --mbid "Artist Name=<mbid>"
+python3 deezer2mb.py https://www.deezer.com/artist/123 --mbid "Artist Name=<mbid>"
 ```
 
 ## Discography JSON
