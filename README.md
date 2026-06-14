@@ -1,4 +1,4 @@
-# mb-batch-submit
+# deezer2mb
 
 A Playwright-based tool for bulk-submitting an artist's discography from Deezer to MusicBrainz. Drives the MusicBrainz Knockout.js release editor programmatically — no manual clicking required after the initial login.
 
