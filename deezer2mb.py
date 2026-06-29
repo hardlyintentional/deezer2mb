@@ -328,6 +328,28 @@ def submit_release(page, title, mb_type, rg_mbid, artists, year, month, day,
     page.keyboard.press("Tab")
     page.wait_for_timeout(800)
 
+    # Set release status to Official (statusID=1 in MB numbering).
+    # Without this, releases are submitted with status=None and Lidarr filters them
+    # out if the metadata profile only allows Official releases.
+    status_result = page.evaluate("""() => {
+        const rel = MB._releaseEditor?.rootField?.release?.();
+        if (rel && typeof rel.statusID === 'function') {
+            rel.statusID(1);
+            return 'ko';
+        }
+        return null;
+    }""")
+    if status_result != 'ko':
+        # Fallback: find the Status select element by its options
+        for sel in page.locator('select').all():
+            opts = [o.inner_text().strip() for o in sel.locator('option').all()]
+            if 'Official' in opts:
+                sel.select_option(label='Official')
+                status_result = 'select'
+                break
+    print(f"  Status set via: {status_result or 'NOT SET — check form'}")
+    page.wait_for_timeout(300)
+
     page.locator('a[href="#tracklist"]').click()
     page.wait_for_timeout(1500)
     page.evaluate("""() => {
