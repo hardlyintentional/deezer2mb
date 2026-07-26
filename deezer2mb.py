@@ -12,7 +12,7 @@ Usage:
 """
 
 from playwright.sync_api import sync_playwright
-import os, json, urllib.request, urllib.parse, time, re, sys, argparse
+import os, json, urllib.request, urllib.parse, time, re, sys, argparse, subprocess, shutil, tempfile, socket
 
 STATE_PATH = os.path.expanduser("~/.config/musicbrainz/browser_state.json")
 DELAY_BETWEEN_RELEASES = 12  # seconds between submissions
@@ -21,6 +21,75 @@ _contact = os.environ.get("MB_CONTACT_EMAIL", "your-email@example.com")
 UA = f"mb-batch-submit/1.0 ({_contact})"
 
 MBID_CACHE = {}  # populated dynamically via mb_search_artist()
+
+# Playwright's bundled Chromium build is unsupported on this host and crashes
+# intermittently (Skia SkFontMgr_FontConfigInterface "Not implemented" abort)
+# while rendering MusicBrainz pages. Drive the system's Flatpak Chrome over
+# CDP instead — it's a properly-compiled build and does not hit this bug.
+def _free_port():
+    """Pick a free port per launch. A fixed port is unsafe here: if a previous
+    Chrome hasn't fully exited it still holds the port, and connect_over_cdp
+    silently attaches to that stale browser instead of the one just started."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def launch_browser(playwright, headless):
+    """Start the system Chrome (Flatpak) with a CDP port and connect Playwright to it.
+    Returns (browser, proc) — call stop_browser(proc) when done."""
+    profile_dir = tempfile.mkdtemp(prefix="deezer2mb-chrome-")
+    port = _free_port()
+    args = ["flatpak", "run", "com.google.Chrome",
+            f"--remote-debugging-port={port}",
+            "--no-first-run", "--no-default-browser-check",
+            f"--user-data-dir={profile_dir}"]
+    if headless:
+        args.append("--headless=new")
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # stop_browser needs these to clean up the sandboxed Chrome behind `flatpak run`.
+    proc.profile_dir = profile_dir
+    proc.cdp_port = port
+
+    deadline = time.time() + 30
+    url = f"http://localhost:{port}/json/version"
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            break
+        except Exception:
+            time.sleep(0.3)
+    else:
+        stop_browser(proc)
+        raise RuntimeError("System Chrome did not open its CDP port in time")
+
+    browser = playwright.chromium.connect_over_cdp(f"http://localhost:{port}")
+    return browser, proc
+
+
+def stop_browser(proc):
+    """`flatpak run` is only a launcher — terminating it leaves the sandboxed
+    Chrome running, still holding its CDP port and profile. Kill anything using
+    this launch's unique profile dir so the next launch gets a clean slate."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    profile_dir = getattr(proc, "profile_dir", None)
+    if not profile_dir:
+        return
+    subprocess.run(["pkill", "-f", profile_dir], check=False)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if subprocess.run(["pgrep", "-f", profile_dir],
+                          stdout=subprocess.DEVNULL).returncode != 0:
+            break
+        time.sleep(0.3)
+    else:
+        subprocess.run(["pkill", "-9", "-f", profile_dir], check=False)
+    shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 # ── Deezer helpers ────────────────────────────────────────────────────────────
@@ -63,13 +132,20 @@ def fetch_deezer_album(album_id):
 
 # ── MusicBrainz helpers ───────────────────────────────────────────────────────
 
-def mb_get(path, params=None):
+def mb_get(path, params=None, retries=4):
     url = f"https://musicbrainz.org/ws/2/{path}"
     if params:
         url += '?' + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (503, 502, 429) and attempt < retries - 1:
+                time.sleep(2 ** attempt * 2)
+                continue
+            raise
 
 
 def mb_search_artist(name):
@@ -454,13 +530,15 @@ def ensure_session():
     """Check session validity; open headed browser for re-login if expired."""
     if os.path.exists(STATE_PATH):
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(storage_state=STATE_PATH)
-            page = ctx.new_page()
-            page.goto("https://musicbrainz.org/release/add")
-            page.wait_for_load_state("networkidle", timeout=15000)
-            logged_in = page.locator('#name').count() > 0
-            browser.close()
+            browser, proc = launch_browser(p, headless=True)
+            try:
+                ctx = browser.new_context(storage_state=STATE_PATH)
+                page = ctx.new_page()
+                page.goto("https://musicbrainz.org/release/add")
+                page.wait_for_load_state("networkidle", timeout=15000)
+                logged_in = page.locator('#name').count() > 0
+            finally:
+                stop_browser(proc)
         if logged_in:
             print("MB session: valid")
             return
@@ -470,14 +548,19 @@ def ensure_session():
 
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        ctx = browser.new_context()
-        page = ctx.new_page()
-        page.goto("https://musicbrainz.org/login")
-        print("  Log in to MusicBrainz in the browser window, then wait...")
-        page.wait_for_url(lambda url: 'login' not in url, timeout=120000)
-        ctx.storage_state(path=STATE_PATH)
-        browser.close()
+        browser, proc = launch_browser(p, headless=False)
+        try:
+            # Drive the CDP connection's *default* context — that's the window
+            # actually on screen. A fresh new_context() would open a page the
+            # user never sees, so the login form appears to never load.
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto("https://musicbrainz.org/login")
+            print("  Log in to MusicBrainz in the browser window, then wait...")
+            page.wait_for_url(lambda url: 'login' not in url, timeout=300000)
+            ctx.storage_state(path=STATE_PATH)
+        finally:
+            stop_browser(proc)
     print("  Session saved.")
 
 
@@ -502,105 +585,133 @@ def batch_process(disc_path, start_idx=0, limit=None):
     print(f"Processing {len(targets)} releases from {disc_path}...")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(storage_state=STATE_PATH)
-        page = ctx.new_page()
+        browser, proc = launch_browser(p, headless=True)
+        try:
+            ctx = browser.new_context(storage_state=STATE_PATH)
+            page = ctx.new_page()
 
-        submitted = 0
-        failed = []
+            submitted = 0
+            failed = []
 
-        for batch_n, (idx, release) in enumerate(targets):
-            title = release['title']
-            record_type = release.get('record_type', 'single')
-            deezer_id = release['id']
-            deezer_url = f"https://www.deezer.com/album/{deezer_id}"
+            for batch_n, (idx, release) in enumerate(targets):
+                title = release['title']
+                record_type = release.get('record_type', 'single')
+                deezer_id = release['id']
+                deezer_url = f"https://www.deezer.com/album/{deezer_id}"
 
-            print(f"\n[{batch_n+1}/{len(targets)}] {title} (idx={idx}, type={record_type})")
+                print(f"\n[{batch_n+1}/{len(targets)}] {title} (idx={idx}, type={record_type})")
 
-            try:
-                album_data = fetch_deezer_album(deezer_id)
-                release_date = album_data.get('release_date', '')
-                parts = release_date.split('-') if release_date else ['', '', '']
-                year = parts[0] if len(parts) > 0 else ''
-                month = parts[1] if len(parts) > 1 else ''
-                day = parts[2] if len(parts) > 2 else ''
+                if not browser.is_connected():
+                    print("  Browser was found disconnected — restarting before this release...")
+                    stop_browser(proc)
+                    browser, proc = launch_browser(p, headless=True)
+                    ctx = browser.new_context(storage_state=STATE_PATH)
+                    page = ctx.new_page()
 
-                artists = build_artists(album_data)
+                release_done = False
+                session_expired = False
 
-                for a in artists:
-                    if not a['mbid']:
-                        print(f"  Artist '{a['name']}' not on MB — creating...")
-                        a['mbid'] = create_artist(ctx, a['name'])
-                        if not a['mbid']:
-                            raise RuntimeError(f"Could not create artist '{a['name']}' on MB")
-                        print(f"  Created artist: {a['mbid']}")
-                        time.sleep(2)
+                for attempt in range(2):
+                    try:
+                        album_data = fetch_deezer_album(deezer_id)
+                        release_date = album_data.get('release_date', '')
+                        parts = release_date.split('-') if release_date else ['', '', '']
+                        year = parts[0] if len(parts) > 0 else ''
+                        month = parts[1] if len(parts) > 1 else ''
+                        day = parts[2] if len(parts) > 2 else ''
 
-                for a in artists:
-                    print(f"  artist: {a['name']} ({a['mbid']}) join='{a['join']}'")
+                        artists = build_artists(album_data)
 
-                tracks = build_tracks(album_data)
-                print(f"  tracks: {len(tracks)}, date: {year}-{month}-{day}")
+                        for a in artists:
+                            if not a['mbid']:
+                                print(f"  Artist '{a['name']}' not on MB — creating...")
+                                a['mbid'] = create_artist(ctx, a['name'])
+                                if not a['mbid']:
+                                    raise RuntimeError(f"Could not create artist '{a['name']}' on MB")
+                                print(f"  Created artist: {a['mbid']}")
+                                time.sleep(2)
 
-                mb_type = {'album': 'album', 'ep': 'ep', 'single': 'single'}.get(record_type, 'single')
-                edit_note = f"new {mb_type}"
+                        for a in artists:
+                            print(f"  artist: {a['name']} ({a['mbid']}) join='{a['join']}'")
 
-                rg_mbid = release.get('rg_mbid')
-                if not rg_mbid:
-                    print(f"  Creating RG...")
-                    rg_mbid = create_rg(ctx, title, mb_type, artists[0]['mbid'])
-                    if not rg_mbid:
-                        raise RuntimeError("RG_CREATION_FAILED")
-                    with open(disc_path) as f:
-                        data = json.load(f)
-                    data[idx]['rg_mbid'] = rg_mbid
-                    save_disc(disc_path, data)
-                    print(f"  RG: {rg_mbid}")
-                else:
-                    print(f"  Reusing RG: {rg_mbid}")
+                        tracks = build_tracks(album_data)
+                        print(f"  tracks: {len(tracks)}, date: {year}-{month}-{day}")
 
-                print(f"  Submitting...")
-                result_url = submit_release(
-                    page, title, mb_type, rg_mbid, artists,
-                    year, month, day, deezer_url, tracks, edit_note
-                )
+                        mb_type = {'album': 'album', 'ep': 'ep', 'single': 'single'}.get(record_type, 'single')
+                        edit_note = f"new {mb_type}"
 
-                with open(disc_path) as f:
-                    data = json.load(f)
-                data[idx]['mb_status'] = 'EXISTS'
-                data[idx]['mb_url'] = result_url
-                save_disc(disc_path, data)
+                        rg_mbid = release.get('rg_mbid')
+                        if not rg_mbid:
+                            print(f"  Creating RG...")
+                            rg_mbid = create_rg(ctx, title, mb_type, artists[0]['mbid'])
+                            if not rg_mbid:
+                                raise RuntimeError("RG_CREATION_FAILED")
+                            with open(disc_path) as f:
+                                data = json.load(f)
+                            data[idx]['rg_mbid'] = rg_mbid
+                            save_disc(disc_path, data)
+                            release['rg_mbid'] = rg_mbid
+                            print(f"  RG: {rg_mbid}")
+                        else:
+                            print(f"  Reusing RG: {rg_mbid}")
 
-                submitted += 1
-                print(f"  DONE: {result_url}")
+                        print(f"  Submitting...")
+                        result_url = submit_release(
+                            page, title, mb_type, rg_mbid, artists,
+                            year, month, day, deezer_url, tracks, edit_note
+                        )
 
-                if batch_n < len(targets) - 1:
-                    print(f"  Waiting {DELAY_BETWEEN_RELEASES}s...")
-                    time.sleep(DELAY_BETWEEN_RELEASES)
+                        with open(disc_path) as f:
+                            data = json.load(f)
+                        data[idx]['mb_status'] = 'EXISTS'
+                        data[idx]['mb_url'] = result_url
+                        save_disc(disc_path, data)
 
-            except RuntimeError as e:
-                err = str(e)
-                print(f"  FAILED: {err}")
-                failed.append((idx, title, err))
-                with open(disc_path) as f:
-                    data = json.load(f)
-                data[idx]['mb_status'] = 'FAILED'
-                data[idx]['fail_reason'] = err
-                save_disc(disc_path, data)
-                if 'SESSION_EXPIRED' in err:
-                    print("  Session expired — aborting batch. Re-login and resume with --start.")
+                        submitted += 1
+                        print(f"  DONE: {result_url}")
+                        release_done = True
+                        break
+
+                    except RuntimeError as e:
+                        err = str(e)
+                        print(f"  FAILED: {err}")
+                        failed.append((idx, title, err))
+                        with open(disc_path) as f:
+                            data = json.load(f)
+                        data[idx]['mb_status'] = 'FAILED'
+                        data[idx]['fail_reason'] = err
+                        save_disc(disc_path, data)
+                        if 'SESSION_EXPIRED' in err:
+                            print("  Session expired — aborting batch. Re-login and resume with --start.")
+                            session_expired = True
+                        break
+
+                    except Exception as e:
+                        crashed = (not browser.is_connected()) or 'has been closed' in str(e)
+                        if crashed and attempt == 0:
+                            print(f"  Browser crashed ({type(e).__name__}: {e}) — restarting and retrying this release...")
+                            stop_browser(proc)
+                            browser, proc = launch_browser(p, headless=True)
+                            ctx = browser.new_context(storage_state=STATE_PATH)
+                            page = ctx.new_page()
+                            continue
+                        print(f"  UNEXPECTED: {type(e).__name__}: {e}")
+                        failed.append((idx, title, str(e)))
+                        with open(disc_path) as f:
+                            data = json.load(f)
+                        data[idx]['mb_status'] = 'FAILED'
+                        data[idx]['fail_reason'] = f"{type(e).__name__}: {e}"
+                        save_disc(disc_path, data)
+                        break
+
+                if session_expired:
                     break
 
-            except Exception as e:
-                print(f"  UNEXPECTED: {type(e).__name__}: {e}")
-                failed.append((idx, title, str(e)))
-                with open(disc_path) as f:
-                    data = json.load(f)
-                data[idx]['mb_status'] = 'FAILED'
-                data[idx]['fail_reason'] = f"{type(e).__name__}: {e}"
-                save_disc(disc_path, data)
-
-        browser.close()
+                if release_done and batch_n < len(targets) - 1:
+                    print(f"  Waiting {DELAY_BETWEEN_RELEASES}s...")
+                    time.sleep(DELAY_BETWEEN_RELEASES)
+        finally:
+            stop_browser(proc)
 
     print(f"\n{'='*50}")
     print(f"Submitted: {submitted}/{len(targets)}")
